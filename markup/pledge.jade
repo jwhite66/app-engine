@@ -87,26 +87,6 @@ html
                     charged.
                   p Use this form to pledge.
               .row
-                .col-md-12
-                  label Occupation
-                  .input-group.input-group-lg
-                    input.form-control(type="text", required,
-                      placeholder="Gardner, Railroad Worker, etc",
-                      ng-model="ctrl.userinfo.occupation")
-              .row
-                .col-md-12
-                  label Employer
-                  .input-group.input-group-lg
-                    input.form-control(type="text", required,
-                      placeholder="Nintendo, UPS, Self, etc"
-                      ng-model="ctrl.userinfo.employer")
-              .row
-                .col-md-6
-                  label Phone Number (optional)
-                  .input-group.input-group-lg
-                    input.form-control(type="tel",
-                      placeholder="(212) 867-5309"
-                      ng-model="ctrl.userinfo.phone")
                 .col-md-6
                   label Who to Fund?
                   .input-group.input-group-lg
@@ -114,6 +94,12 @@ html
                       option Whatever Helps
                       option Democrats Only
                       option Republicans Only
+                .col-md-6
+                  label Phone Number (optional)
+                  .input-group.input-group-lg
+                    input.form-control(type="tel",
+                      placeholder="(212) 867-5309"
+                      ng-model="ctrl.userinfo.phone")
               .row
                 .col-md-12
                   label Amount
@@ -123,6 +109,24 @@ html
                       ng-model="ctrl.amount")
                     span.input-group-btn
                       button.btn.btn-danger(type="submit") Pledge
+              .row(ng-show="ctrl.amount > 199")
+                .col-md-12
+                  label Occupation
+                  .input-group.input-group-lg
+                    input.form-control(type="text", ng-required="ctrl.amount > 199",
+                      placeholder="Gardner, Railroad Worker, etc",
+                      ng-model="ctrl.userinfo.occupation")
+              .row(ng-show="ctrl.amount > 199")
+                .col-md-12
+                  label Employer
+                  .input-group.input-group-lg
+                    input.form-control(type="text", ng-required="ctrl.amount > 199",
+                      placeholder="Nintendo, UPS, Self, etc"
+                      ng-model="ctrl.userinfo.employer")
+              .row(ng-show="ctrl.amount > 49")
+                .col-md-12
+                  p.alert.alert-info Federal Campaign Finance Law requires us to track the address of any donor giving $50 or more. We will use the credit card billing address you provide.
+                  p.alert.alert-info(ng-show="ctrl.amount > 199") For donations of $200 or more, the FEC also requires employer information.
 
             .col-md-12
               h3 Donate Directly
