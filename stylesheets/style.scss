@@ -271,6 +271,16 @@ p, div {
     }
 }
 
+.paypal {
+    display:table-cell;
+    vertical-align:middle;
+    float:none;
+}
+
+.spinning {
+    margin-top: 20px;
+}
+
 .embed-pledge {
     margin: 20px auto;
     text-align: center;

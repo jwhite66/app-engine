@@ -23,6 +23,11 @@ handlers:
   upload: static/*
   secure: always
 
+- url: /paypal-return/?
+  static_files: static/paypal-return.html
+  upload: static/*
+  secure: always
+
 - url: /privacy/?
   static_files: static/privacy.html
   upload: static/*

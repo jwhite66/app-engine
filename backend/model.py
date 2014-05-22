@@ -19,7 +19,8 @@ class Error(Exception): pass
 #   <missing>: Initial model.
 #   2: Implemented sharded counter for donation total. Objects before
 #      this version are not included in that counter.
-MODEL_VERSION = 2
+#   3: Added Paypal fields
+MODEL_VERSION = 3
 
 
 # Config singleton. Loaded once per instance and never modified. It's
@@ -31,7 +32,9 @@ MODEL_VERSION = 2
 class Config(object):
   ConfigType = namedtuple('ConfigType',
                           ['app_name',
-                           'stripe_public_key', 'stripe_private_key'])
+                           'stripe_public_key', 'stripe_private_key',
+                           'paypal_user', 'paypal_password', 'paypal_signature',
+                           'paypal_url', 'paypal_api_url'])
   _instance = None
 
   @staticmethod
@@ -52,10 +55,35 @@ class Config(object):
       stripe_public_key = None
       stripe_private_key = None
 
+    if s:
+      paypal_user = s.paypal_sandbox_user
+      paypal_password = s.paypal_sandbox_password
+      paypal_signature = s.paypal_sandbox_signature
+    else:
+      paypal_user = None
+      paypal_password = None
+      paypal_signature = None
+
+    paypal_api_url = "https://api-3t.sandbox.paypal.com/nvp"
+    paypal_url = "https://www.sandbox.paypal.com/webscr"
+
+    if 'productionPaypal' in j and j['productionPaypal']:
+      paypal_user = s.paypal_user
+      paypal_password = s.paypal_password
+      paypal_signature = s.paypal_signature
+      paypal_api_url = "https://api-3t.paypal.com/nvp"
+      paypal_url = "https://www.paypal.com/webscr"
+
     Config._instance = Config.ConfigType(
       app_name = j['appName'],
       stripe_public_key=stripe_public_key,
-      stripe_private_key=stripe_private_key)
+      stripe_private_key=stripe_private_key,
+      paypal_user = paypal_user,
+      paypal_password = paypal_password,
+      paypal_signature = paypal_signature,
+      paypal_api_url = paypal_api_url,
+      paypal_url = paypal_url
+      )
     return Config._instance
 
 
@@ -64,6 +92,12 @@ class Secrets(db.Model):
   # We include the public key so they're never out of sync.
   stripe_public_key = db.StringProperty(required=True)
   stripe_private_key = db.StringProperty(required=True)
+  paypal_sandbox_user = db.StringProperty()
+  paypal_sandbox_password = db.StringProperty()
+  paypal_sandbox_signature = db.StringProperty()
+  paypal_user = db.StringProperty()
+  paypal_password = db.StringProperty()
+  paypal_signature = db.StringProperty()
 
   @staticmethod
   def get():
@@ -74,11 +108,19 @@ class Secrets(db.Model):
     return s[0] if s else None
 
   @staticmethod
-  def update(stripe_public_key, stripe_private_key):
+  def update(stripe_public_key, stripe_private_key,
+        paypal_sandbox_user, paypal_sandbox_password, paypal_sandbox_signature,
+        paypal_user, paypal_password, paypal_signature):
     if list(Secrets.all()):
       raise Error('DB already contains secrets. Delete them first')
     s = Secrets(stripe_public_key=stripe_public_key,
-                stripe_private_key=stripe_private_key)
+                stripe_private_key=stripe_private_key,
+                paypal_sandbox_user=paypal_sandbox_user,
+                paypal_sandbox_password=paypal_sandbox_password,
+                paypal_sandbox_signature=paypal_sandbox_signature,
+                paypal_user=paypal_user,
+                paypal_password=paypal_password,
+                paypal_signature=paypal_signature)
     s.put()
 
 
@@ -139,10 +181,20 @@ class Pledge(db.Model):
 
   # this is the string id for the stripe api to access the customer. we are
   # doing a whole stripe customer per pledge.
-  stripeCustomer = db.StringProperty(required=True)
+  stripeCustomer = db.StringProperty()
+
+  # Paypal specific fields
+  paypalTransactionID = db.StringProperty()
+  paypalToken = db.StringProperty()
+  paypalPayerID = db.StringProperty()
+  paypalCapturedTransactionID = db.StringProperty()
 
   # when the donation occurred
   donationTime = db.DateTimeProperty(auto_now_add=True)
+
+  # Information taken when actually capturing funds
+  captureTime = db.DateTimeProperty()
+  captureStatus = db.StringProperty()
 
   # we plan to have multiple fundraising rounds. right now we're in round "1"
   fundraisingRound = db.StringProperty(required=True)
@@ -160,11 +212,15 @@ class Pledge(db.Model):
   url_nonce = db.StringProperty(required=True)
 
   @staticmethod
-  def create(email, stripe_customer_id, amount_cents, fundraisingRound="1",
-             note=None):
+  def create(email, stripe_customer_id,
+             paypal_txn_id, paypal_token, paypal_payer_id,
+             amount_cents, fundraisingRound="1", note=None):
     pledge = Pledge(model_version=MODEL_VERSION,
                     email=email,
                     stripeCustomer=stripe_customer_id,
+                    paypalTransactionID=paypal_txn_id,
+                    paypalToken=paypal_token,
+                    paypalPayerID=paypal_payer_id,
                     fundraisingRound=fundraisingRound,
                     amountCents=amount_cents,
                     note=note,
@@ -173,15 +229,24 @@ class Pledge(db.Model):
     return pledge
 
 
-def addPledge(email, stripe_customer_id, amount_cents, occupation=None,
-              employer=None, phone=None, fundraisingRound="1", target=None,
-              note=None):
+def addPledge(email, amount_cents, stripe_customer_id=None,
+              paypal_txn_id=None, paypal_token=None, paypal_payer_id=None,
+              occupation=None, employer=None, phone=None,
+              fundraisingRound="1", target=None, note=None):
   """Creates a User model if one doesn't exist, finding one if one already
   does, using the email as a user key. Then adds a Pledge to the User with
   the given card token as a new credit card.
 
   @return: the pledge
   """
+
+  if not (stripe_customer_id or paypal_txn_id):
+      raise Error('We must supply either stripe or Paypal ids')
+
+  if paypal_txn_id:
+    if not (paypal_token and paypal_payer_id):
+      raise Error('We must supply Paypal token and payer id')
+
   # first, let's find the user by email
   User.createOrUpdate(
           email=email, occupation=occupation, employer=employer, phone=phone,
@@ -189,6 +254,7 @@ def addPledge(email, stripe_customer_id, amount_cents, occupation=None,
 
   return Pledge.create(
           email=email, stripe_customer_id=stripe_customer_id,
+          paypal_txn_id=paypal_txn_id, paypal_token=paypal_token, paypal_payer_id=paypal_payer_id,
           amount_cents=amount_cents, fundraisingRound=fundraisingRound,
           note=note)
 

@@ -4,9 +4,13 @@ import jinja2
 import json
 import logging
 import os
+import urllib
 import urllib2
 import webapp2
+import urlparse
+import datetime
 
+from google.appengine.api import urlfetch
 from google.appengine.api import mail, memcache
 from google.appengine.ext import db, deferred
 
@@ -29,16 +33,36 @@ class SetSecretsHandler(webapp2.RequestHandler):
     self.response.write("""
     <form method="post" action="">
       <label>Stripe public key</label>
-      <input name="stripe_public_key">
+      <input name="stripe_public_key"><br>
       <label>Stripe private key</label>
-      <input name="stripe_private_key">
+      <input name="stripe_private_key"><br>
+      <h2>Sandbox Paypal credentials</h2>
+      <label>Sandbox Paypal API username</label>
+      <input name="paypal_sandbox_user"><br>
+      <label>Sandbox Paypal API password</label>
+      <input name="paypal_sandbox_password"><br>
+      <label>Sandbox Paypal API signature</label>
+      <input name="paypal_sandbox_signature"><br>
+      <h2>Real Paypal credentials</h2>
+      <label>Paypal API username</label>
+      <input name="paypal_user"><br>
+      <label>Paypal API password</label>
+      <input name="paypal_password"><br>
+      <label>Paypal API signature</label>
+      <input name="paypal_signature"><br>
       <input type="submit">
     </form>""")
 
   def post(self):
     model.Secrets.update(
       stripe_public_key=self.request.get('stripe_public_key'),
-      stripe_private_key=self.request.get('stripe_private_key'))
+      stripe_private_key=self.request.get('stripe_private_key'),
+      paypal_sandbox_user=self.request.get('paypal_sandbox_user'),
+      paypal_sandbox_password=self.request.get('paypal_sandbox_password'),
+      paypal_sandbox_signature=self.request.get('paypal_sandbox_signature'),
+      paypal_user=self.request.get('paypal_user'),
+      paypal_password=self.request.get('paypal_password'),
+      paypal_signature=self.request.get('paypal_signature'))
 
 
 class AdminDashboardHandler(webapp2.RequestHandler):
@@ -99,6 +123,90 @@ class PledgesCsvHandler(webapp2.RequestHandler):
       w.writerow([str(pledge.donationTime), pledge.amountCents])
 
 
+def PaypalCaptureOne(id):
+  logging.info("Attempting to capture Paypal Transaction " + id)
+  config = model.Config.get()
+
+  trans_key = db.Key.from_path('Pledge', 'transKey', 'paypalTransactionID', id)
+  pledge = model.Pledge.all().filter("paypalTransactionID", id).get()
+
+  form_fields = {
+    "VERSION": "113",
+    "USER": config.paypal_user,
+    "PWD": config.paypal_password,
+    "SIGNATURE": config.paypal_signature,
+    "METHOD": "DoCapture",
+    "AUTHORIZATIONID": pledge.paypalTransactionID,
+    "COMPLETETYPE": "Complete",
+    "AMT": pledge.amountCents / 100,
+  }
+  form_data = urllib.urlencode(form_fields)
+
+  result = urlfetch.fetch(url=config.paypal_api_url, payload=form_data, method=urlfetch.POST,
+              headers={'Content-Type': 'application/x-www-form-urlencoded'})
+
+  result_map = urlparse.parse_qs(result.content)
+
+  pledge.captureStatus = result_map['ACK'][0]
+  pledge.captureTime = datetime.datetime.utcnow()
+
+  if result_map['ACK'][0] == 'Success':
+    pledge.paypalCapturedTransactionID = result_map['TRANSACTIONID'][0]
+    logging.info("Paypal Transaction " + id + " succeeded")
+  else:
+    logging.error("Paypal Transaction " + id + " failed:")
+    logging.error(result.content)
+
+  pledge.put()
+
+class PaypalCaptureHandler(webapp2.RequestHandler):
+  def get(self):
+    self.response.write("""
+    <form method="post" action="">
+      <h1>Warning: This will collect payment from Paypal customers.  Do not use lightly.</h1>
+      <label>Maximum number of pledges to collect:</label>
+      <input name="count"><br>
+      <input type="submit">
+    </form>""")
+    q = model.Pledge.all()
+    q.filter("captureTime = ", None)
+    self.response.write("<p> Paypal pledges ready to collect: " +
+      str(q.count()) + "</p>")
+
+
+  def post(self):
+    count = self.request.get("count")
+    if not count:
+      self.error(400)
+      self.response.write("Error: must limit number of captures.")
+      return
+
+    j = json.load(open('config.json'))
+    if not 'allowCapture' in j or not j['allowCapture']:
+      self.error(400)
+      self.response.write("Error: capture not allowed.")
+      return
+
+    q = model.Pledge.all()
+    q.order("donationTime")
+    q.filter("captureTime = ", None)
+
+    total = 0
+    queued = 0
+
+    self.response.write("<table><tr><th>email</th><th>amount</th><th>transid</th></tr>")
+
+    for p in q.run(limit=int(count)):
+      # Queue this record for capture
+      deferred.defer(PaypalCaptureOne, p.paypalTransactionID, _queue="paypalCapture")
+      self.response.write("<tr><td>" + p.email + "</td><td>" + str(p.amountCents / 100) +
+           "</td><td>" + p.paypalTransactionID + "</td></tr>")
+      total += p.amountCents
+      queued += 1
+
+    self.response.write("</table><p>" + str(queued) + " pledges queued; total of $" + str(total / 100))
+
+
 def MakeCommandHandler(cmd):
   """Takes a command and returns a route tuple which allows that command
      to be executed.
@@ -123,5 +231,6 @@ COMMAND_HANDLERS = [MakeCommandHandler(c) for c in commands.COMMANDS]
 app = webapp2.WSGIApplication([
   ('/admin/set_secrets', SetSecretsHandler),
   ('/admin/pledges.csv', PledgesCsvHandler),
+  ('/admin/paypal.capture', PaypalCaptureHandler),
   ('/admin/?', AdminDashboardHandler),
 ] + COMMAND_HANDLERS, debug=False)

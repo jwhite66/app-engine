@@ -3,6 +3,7 @@ html
   head
     include includes/head
     script(src="//ajax.googleapis.com/ajax/libs/angularjs/1.2.15/angular.min.js")
+    script(src="//fgnass.github.io/spin.js/spin.min.js")
     script.
       var myApp = angular.module('mayOne',[]);
 
@@ -19,8 +20,50 @@ html
             target: 'Whatever Helps',
           },
           error: '',
+          spinning: false,
           cents: function() {
             return Math.floor($scope.ctrl.amount * 100);
+          },
+          paypal: function() {
+            if (! $scope.pledgeForm.$valid) {
+                button = document.getElementById('pledgeButton');
+                var ev = document.createEvent('Events');
+                ev.initEvent('click', true, false);
+                button.dispatchEvent(ev);
+                return;
+            }
+            var spin_opts = {
+                  lines: 13,
+                  length: 10, // The length of each line
+                  width: 5, // The line thickness
+                  radius: 15, // The radius of the inner circle
+                  corners: 1, // Corner roundness (0..1)
+                  rotate: 0, // The rotation offset
+                  direction: 1, // 1: clockwise, -1: counterclockwise
+                  color: '#ffca7a', // #rgb or #rrggbb or array of colors
+                  speed: 1, // Rounds per second
+                  trail: 60, // Afterglow percentage
+                  shadow: false, // Whether to render a shadow
+                  hwaccel: false, // Whether to use hardware acceleration
+                  className: 'spinner', // The CSS class to assign to the spinner
+                  zIndex: 2e9, // The z-index (defaults to 2000000000)
+                  top: '50%', // Top position relative to parent
+                  left: '50%' // Left position relative to parent
+            };
+            $scope.ctrl.spinning = true;
+            var target = document.getElementById('paypalWait');
+            var spinner = new Spinner(spin_opts).spin(target);
+            $http.post('/paypal.start', {
+              amount: $scope.ctrl.cents() / 100,
+              userinfo: $scope.ctrl.userinfo,
+            }).success(function(data, status) {
+              location.href = data.redirect;
+            }).error(function() {
+              spinner.stop();
+              $scope.ctrl.spinning = false;
+              $scope.ctrl.error =
+                'Oops, something went wrong. Try again in a few minutes';
+            })
           },
           pledge: function() {
             var cents = $scope.ctrl.cents();
@@ -71,7 +114,7 @@ html
         .col-md-8
           .row
             h2.col-md-12 Two ways to give
-            form(ng-submit="ctrl.pledge()").col-md-12
+            form(name="pledgeForm",ng-submit="ctrl.pledge()").col-md-12
               h3 Pledge
               .row
                 .col-md-12
@@ -115,14 +158,23 @@ html
                       option Democrats Only
                       option Republicans Only
               .row
-                .col-md-12
+                .col-md-6
                   label Amount
                   .input-group.input-group-lg
                     span.input-group-addon $
                     input.form-control(type="number", required, min="1",
                       ng-model="ctrl.amount")
                     span.input-group-btn
-                      button.btn.btn-danger(type="submit") Pledge
+                      button.btn.btn-danger(id="pledgeButton", type="submit") Pledge
+                .col-md-3.input-lg(ng-show="!ctrl.spinning")
+                    label - Or -
+                .col-md-3.input-lg(ng-show="!ctrl.spinning")
+                    label
+                    img.paypal(src="https://www.paypal.com/en_US/i/btn/x-click-butcc-donate.gif", ng-click="ctrl.paypal()")
+              .row.spinning(ng-show="ctrl.spinning")
+                .col-md-6
+                  label Contacting PayPal...
+                .col-md-6.paypal(id="paypalWait")
 
             .col-md-12
               h3 Donate Directly
@@ -146,11 +198,6 @@ html
                 href="https://mayone.us/faq/#check">pledge by
                 check</A>, we have instructions on the <a
                 href="https://mayone.us/faq/#check">FAQ page</A>.
-
-              p.
-                Some users have expressed an interest in using PayPal,
-                and we are currently working on building that
-                infrastructure.  Stay tuned.
 
         #rules.col-md-4
           h2 Contribution Rules:

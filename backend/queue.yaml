@@ -5,3 +5,8 @@ queue:
 
 - name: incrementTotal
   rate: 60/s
+
+- name: paypalCapture
+  # This will happen rarely; no need to rush.
+  rate: 30/m
+
