@@ -184,7 +184,7 @@ class Pledge(db.Model):
   stripeCustomer = db.StringProperty()
 
   # Paypal specific fields
-  paypalTransactionID = db.StringProperty()
+  paypalBillingAgreementID = db.StringProperty()
   paypalToken = db.StringProperty()
   paypalPayerID = db.StringProperty()
   paypalCapturedTransactionID = db.StringProperty()
@@ -194,7 +194,7 @@ class Pledge(db.Model):
 
   # Information taken when actually capturing funds
   captureTime = db.DateTimeProperty()
-  captureStatus = db.StringProperty()
+  captureError = db.TextProperty()
 
   # we plan to have multiple fundraising rounds. right now we're in round "1"
   fundraisingRound = db.StringProperty(required=True)
@@ -213,12 +213,12 @@ class Pledge(db.Model):
 
   @staticmethod
   def create(email, stripe_customer_id,
-             paypal_txn_id, paypal_token, paypal_payer_id,
+             paypal_billing_id, paypal_token, paypal_payer_id,
              amount_cents, fundraisingRound="1", note=None):
     pledge = Pledge(model_version=MODEL_VERSION,
                     email=email,
                     stripeCustomer=stripe_customer_id,
-                    paypalTransactionID=paypal_txn_id,
+                    paypalBillingAgreementID=paypal_billing_id,
                     paypalToken=paypal_token,
                     paypalPayerID=paypal_payer_id,
                     fundraisingRound=fundraisingRound,
@@ -230,7 +230,7 @@ class Pledge(db.Model):
 
 
 def addPledge(email, amount_cents, stripe_customer_id=None,
-              paypal_txn_id=None, paypal_token=None, paypal_payer_id=None,
+              paypal_billing_id=None, paypal_token=None, paypal_payer_id=None,
               occupation=None, employer=None, phone=None,
               fundraisingRound="1", target=None, note=None):
   """Creates a User model if one doesn't exist, finding one if one already
@@ -240,10 +240,10 @@ def addPledge(email, amount_cents, stripe_customer_id=None,
   @return: the pledge
   """
 
-  if not (stripe_customer_id or paypal_txn_id):
+  if not (stripe_customer_id or paypal_billing_id):
       raise Error('We must supply either stripe or Paypal ids')
 
-  if paypal_txn_id:
+  if paypal_billing_id:
     if not (paypal_token and paypal_payer_id):
       raise Error('We must supply Paypal token and payer id')
 
@@ -254,7 +254,7 @@ def addPledge(email, amount_cents, stripe_customer_id=None,
 
   return Pledge.create(
           email=email, stripe_customer_id=stripe_customer_id,
-          paypal_txn_id=paypal_txn_id, paypal_token=paypal_token, paypal_payer_id=paypal_payer_id,
+          paypal_billing_id=paypal_billing_id, paypal_token=paypal_token, paypal_payer_id=paypal_payer_id,
           amount_cents=amount_cents, fundraisingRound=fundraisingRound,
           note=note)
 

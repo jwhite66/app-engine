@@ -9,6 +9,7 @@ import urllib2
 import webapp2
 import urlparse
 import datetime
+import pprint
 
 from google.appengine.api import urlfetch
 from google.appengine.api import mail, memcache
@@ -16,6 +17,7 @@ from google.appengine.ext import db, deferred
 
 import commands
 import model
+import paypal
 
 JINJA_ENVIRONMENT = jinja2.Environment(
     loader=jinja2.FileSystemLoader('templates/'),
@@ -124,40 +126,39 @@ class PledgesCsvHandler(webapp2.RequestHandler):
 
 
 def PaypalCaptureOne(id):
-  logging.info("Attempting to capture Paypal Transaction " + id)
-  config = model.Config.get()
-
-  trans_key = db.Key.from_path('Pledge', 'transKey', 'paypalTransactionID', id)
-  pledge = model.Pledge.all().filter("paypalTransactionID", id).get()
+  logging.info("Attempting to capture Paypal Billing Agreement " + id)
+  pledge = model.Pledge.all().filter("paypalBillingAgreementID =", id).get()
 
   form_fields = {
-    "VERSION": "113",
-    "USER": config.paypal_user,
-    "PWD": config.paypal_password,
-    "SIGNATURE": config.paypal_signature,
-    "METHOD": "DoCapture",
-    "AUTHORIZATIONID": pledge.paypalTransactionID,
-    "COMPLETETYPE": "Complete",
+    "METHOD": "DoReferenceTransaction",
+    "REFERENCEID": id,
+    "PAYMENTACTION": "Sale",
     "AMT": pledge.amountCents / 100,
   }
-  form_data = urllib.urlencode(form_fields)
+  rc, results = paypal.send_request(form_fields)
 
-  result = urlfetch.fetch(url=config.paypal_api_url, payload=form_data, method=urlfetch.POST,
-              headers={'Content-Type': 'application/x-www-form-urlencoded'})
-
-  result_map = urlparse.parse_qs(result.content)
-
-  pledge.captureStatus = result_map['ACK'][0]
-  pledge.captureTime = datetime.datetime.utcnow()
-
-  if result_map['ACK'][0] == 'Success':
-    pledge.paypalCapturedTransactionID = result_map['TRANSACTIONID'][0]
+  if rc:
+    pledge.paypalCapturedTransactionID = results['TRANSACTIONID'][0]
+    pledge.captureError = None
     logging.info("Paypal Transaction " + id + " succeeded")
-  else:
-    logging.error("Paypal Transaction " + id + " failed:")
-    logging.error(result.content)
 
+  else:
+    logging.error("Paypal Transaction " + id + " failed")
+    pledge.captureError = pprint.pformat(results)
+
+  pledge.captureTime = datetime.datetime.utcnow()
   pledge.put()
+
+  if rc:
+    # Now cancel it
+    form_fields = {
+      "METHOD": "BillAgreementUpdate",
+      "REFERENCEID": id,
+      "BILLINGAGREEMENTSTATUS": "Canceled",
+    }
+    rc, results = paypal.send_request(form_fields)
+
+
 
 class PaypalCaptureHandler(webapp2.RequestHandler):
   def get(self):
@@ -198,9 +199,9 @@ class PaypalCaptureHandler(webapp2.RequestHandler):
 
     for p in q.run(limit=int(count)):
       # Queue this record for capture
-      deferred.defer(PaypalCaptureOne, p.paypalTransactionID, _queue="paypalCapture")
+      deferred.defer(PaypalCaptureOne, p.paypalBillingAgreementID, _queue="paypalCapture")
       self.response.write("<tr><td>" + p.email + "</td><td>" + str(p.amountCents / 100) +
-           "</td><td>" + p.paypalTransactionID + "</td></tr>")
+           "</td><td>" + p.paypalBillingAgreementID + "</td></tr>")
       total += p.amountCents
       queued += 1
 

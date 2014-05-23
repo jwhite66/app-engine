@@ -4,6 +4,7 @@ import logging
 import urlparse
 import webapp2
 import urllib
+import pprint
 
 from google.appengine.api import urlfetch
 from google.appengine.api import mail
@@ -14,6 +15,7 @@ from google.appengine.ext import deferred
 import model
 import stripe
 import wp_import
+import paypal
 
 # These get added to every pledge calculation
 PRE_SHARDING_TOTAL = 27425754  # See model.ShardedCounter
@@ -184,6 +186,7 @@ class PledgeHandler(webapp2.RequestHandler):
     self.response.write('Ok.')
 
 
+
 # Paypal Step 1:  We tell Paypal *what* we want the user to do
 class PaypalStartHandler(webapp2.RequestHandler):
   def post(self):
@@ -208,27 +211,18 @@ class PaypalStartHandler(webapp2.RequestHandler):
 
     amount = data['amount']
 
-    config = model.Config.get()
-
     form_fields = {
-      "VERSION": "113",
-      "USER": config.paypal_user,
-      "PWD": config.paypal_password,
-      "SIGNATURE": config.paypal_signature,
       "METHOD": "SetExpressCheckout",
-      "RETURNURL": self.request.host_url + '/paypal-return',
+      "RETURNURL": self.request.host_url + '/paypal.return',
       "CANCELURL": self.request.host_url + '/pledge',
       "NOSHIPPING": "1" if amount < 50 else "0",
       "REQCONFIRMSHIPPING": "0" if amount < 50 else "1",
-      "PAYMENTREQUEST_0_AMT": amount,
-      "PAYMENTREQUEST_0_PAYMENTACTION": "Authorization",
-      "PAYMENTREQUEST_0_CUSTOM": urllib.urlencode(data['userinfo']),
+      "MAXAMT": "%d.00" % amount,
       "PAYMENTREQUEST_0_NAME": "Pledge to MayDay One PAC",
-      "PAYMENTREQUEST_0_AMT":  amount,
-      "PAYMENTREQUEST_0_QTY":  "1",
-      "L_PAYMENTREQUEST_0_NAME0": "Pledge to MayDay One PAC",
-      "L_PAYMENTREQUEST_0_AMT0":  amount,
-      "L_PAYMENTREQUEST_0_QTY0":  "1",
+      "PAYMENTREQUEST_0_AMT":  "%d.00" % amount,
+      "PAYMENTREQUEST_0_CUSTOM": urllib.urlencode(data['userinfo']),
+      "L_BILLINGTYPE0":  "MerchantInitiatedBillingSingleAgreement",
+      "L_BILLINGAGREEMENTDESCRIPTION0": "Pledge of $%d to MayDay One PAC" % amount,
       "SOLUTIONTYPE":  "Sole",
       "BRANDNAME":  "MayDay PAC",
       # TODO FIXME - LOGOIMG trumps if given; it's a different look with HDRIMG
@@ -238,45 +232,27 @@ class PaypalStartHandler(webapp2.RequestHandler):
       #"CARTBORDERCOLOR": "0000FF",
       # TODO FIXME Explore colors.  Seems like either color has same result, and cart trumps
     }
-    form_data = urllib.urlencode(form_fields)
 
-    result = urlfetch.fetch(url=config.paypal_api_url, payload=form_data, method=urlfetch.POST,
-                headers={'Content-Type': 'application/x-www-form-urlencoded'})
+    rc, results = paypal.send_request(form_fields)
 
-    result_map = urlparse.parse_qs(result.content)
-
-    try:
-      if result_map['ACK'][0] != 'Success':
-        raise NameError('Paypal failed to give Success ACK')
-      if result_map['TOKEN'][0] is None:
-        raise NameError('Paypal failed to return a TOKEN')
-
-    except Exception, e:
+    if not rc:
       self.error(400)
       self.response.write('Paypal SetExpressCheckout failed.')
-      self.response.write(str(e))
-      logging.warning(str(e) + result.content[:1000])
       return
 
+    config = model.Config.get()
     self.response.headers['Content-Type'] = 'application/json'
     self.response.write('{"redirect":"' + config.paypal_url + "?cmd=_express-checkout&token="
-                            + result_map['TOKEN'][0] + '"}')
+                            + results['TOKEN'][0] + '"}')
 
     #  And now the user is supposed to go off and do it...
 
 # Paypal Step 2: Paypal returns to us, telling us the user has agreed to do it
-#                So we get the details so the user can confirm them
-class PaypalDetailsHandler(webapp2.RequestHandler):
-  def post(self):
-    try:
-      data = json.loads(self.request.body)
-    except:
-      logging.warning("Bad JSON request")
-      self.error(400)
-      self.response.write('Invalid request')
-      return
-
-    token = data['token']
+class PaypalReturnHandler(webapp2.RequestHandler):
+  def get(self):
+    token = self.request.get("token")
+    if not token:
+      token = self.request.get("TOKEN")
 
     if not token:
       logging.warning("Paypal completion missing token: " + self.request.url)
@@ -285,87 +261,64 @@ class PaypalDetailsHandler(webapp2.RequestHandler):
       self.response.write(self.request.url)
       return
 
-    config = model.Config.get()
 
     # Fetch the details of this pending transaction
     form_fields = {
-      "VERSION": "113",
-      "USER": config.paypal_user,
-      "PWD": config.paypal_password,
-      "SIGNATURE": config.paypal_signature,
+      "METHOD": "CreateBillingAgreement",
+      "TOKEN": token
+    }
+    rc, results = paypal.send_request(form_fields)
+    if not rc:
+        self.error(400);
+        self.response.write("Unusual error: Could not get billing agreement from Paypal.  Please contact info@mayone.us and report these details:")
+        self.response.write(pprint.pformat(results))
+        return
+
+    billing_id = results['BILLINGAGREEMENTID'][0]
+
+    # Fetch the details of this pending transaction
+    form_fields = {
       "METHOD": "GetExpressCheckoutDetails",
       "TOKEN": token
     }
-    form_data = urllib.urlencode(form_fields)
+    rc, results = paypal.send_request(form_fields)
+    if not rc:
+        self.error(400);
+        self.response.write("Unusual error: Could not get payment details from Paypal.  Please contact info@mayone.us and report these details:")
+        self.response.write(pprint.pformat(results))
+        return
 
-    result = urlfetch.fetch(url=config.paypal_api_url, payload=form_data, method=urlfetch.POST,
-                headers={'Content-Type': 'application/x-www-form-urlencoded'})
-    result_map = urlparse.parse_qs(result.content)
-    json.dump(result_map, self.response)
+    name = ""
+    if 'FIRSTNAME' in results:
+        name += results['FIRSTNAME'][0]
+    if 'MIDDLENAME' in results:
+        name += " " + results['FIRSTNAME'][0]
+    if 'LASTNAME' in results:
+        if len(name) > 0:
+            name += " "
+        name += results['LASTNAME'][0]
 
+    note = None
+    if 'PAYMENTREQUEST_0_NOTETEXT' in results:
+        note = results['PAYMENTREQUEST_0_NOTETEXT'][0]
 
-# Paypal Step 3: The user has affirmed the pledge - book it!
-class PaypalCompleteHandler(webapp2.RequestHandler):
-  def post(self):
-    token = self.request.get("token")
-    payer_id = self.request.get("payer_id")
-    amount = self.request.get("amount")
+    email = results['EMAIL'][0]
+    amount = results['PAYMENTREQUEST_0_AMT'][0]
     cents = int(float(amount)) * 100
-    occupation = self.request.get("occupation")
-    employer = self.request.get("employer")
-    phone = self.request.get("phone")
-    email = self.request.get("email")
-    note = self.request.get("note")
-    name = self.request.get("name")
-    target = self.request.get("target")
-
-    if not token:
-      logging.warning("Paypal completion missing token: " + self.request.url)
-      self.error(400);
-      self.response.write("Unusual error: no token from Paypal.  Please contact info@mayone.us and report these details:")
-      self.response.write(self.request.url)
-      return
-
-    config = model.Config.get()
-
-    # Now we have to DoExpressCheckoutPayment and *then* we are done...
-    form_fields = {
-      "VERSION": "113",
-      "USER": config.paypal_user,
-      "PWD": config.paypal_password,
-      "SIGNATURE": config.paypal_signature,
-      "METHOD": "DoExpressCheckoutPayment",
-      "PAYMENTREQUEST_0_PAYMENTACTION": "Authorization",
-      "TOKEN": token,
-      "PAYERID": payer_id,
-      "PAYMENTREQUEST_0_AMT": amount,
-      "PAYMENTREQUEST_0_NAME": "Pledge to MayDay One PAC",
-      "PAYMENTREQUEST_0_QTY":  "1",
-    }
-
-    form_data = urllib.urlencode(form_fields)
-
-    result = urlfetch.fetch(url=config.paypal_api_url, payload=form_data, method=urlfetch.POST,
-                headers={'Content-Type': 'application/x-www-form-urlencoded'})
-
-    result_map = urlparse.parse_qs(result.content)
-    if result_map['ACK'][0] != 'Success':
-      logging.warning("Paypal DoExpressCheckout failed. ")
-      logging.warning("Response: " + result.content)
-
-      self.error(400);
-      self.response.write("Unusual error: No Checkout Completion from Paypal.  Please contact info@mayone.us and report these details:")
-      self.response.write(result.content)
-      return
+    payer_id = results['PAYERID'][0]
+    userinfo = urlparse.parse_qs(results['CUSTOM'][0])
 
     #  At this point, we have finished the whole Paypal cycle; we just
     #   need to record all our information
 
     pledge = model.addPledge(
-            email=email, amount_cents=cents, paypal_txn_id=result_map['PAYMENTINFO_0_TRANSACTIONID'][0],
+            email=email, amount_cents=cents, paypal_billing_id=billing_id,
             paypal_token=token, paypal_payer_id=payer_id,
-            occupation=occupation, employer=employer, phone=phone,
-            target=target, note=note)
+            occupation=userinfo['occupation'][0],
+            employer=userinfo['employer'][0],
+            phone=userinfo['phone'][0],
+            target=userinfo['target'][0],
+            note=note)
 
     # Add thank you email to a task queue
     deferred.defer(send_thank_you, name or email, email,
@@ -374,7 +327,7 @@ class PaypalCompleteHandler(webapp2.RequestHandler):
     # Add to the total asynchronously.
     deferred.defer(model.increment_donation_total, cents, _queue="incrementTotal")
 
-    self.redirect("/thankyou")
+    self.redirect("/thankyou?paypal=1")
     # Add thank you email to a task queue
 
 class UserUpdateHandler(webapp2.RequestHandler):
@@ -415,8 +368,7 @@ app = webapp2.WSGIApplication([
   ('/stripe_public_key', GetStripePublicKeyHandler),
   ('/pledge.do', PledgeHandler),
   ('/paypal.start', PaypalStartHandler),
-  ('/paypal.details', PaypalDetailsHandler),
-  ('/paypal.complete', PaypalCompleteHandler),
+  ('/paypal.return', PaypalReturnHandler),
   ('/user-update/(\w+)', UserUpdateHandler),
   ('/campaigns/may-one/?', EmbedHandler),
   ('/contact.do', ContactHandler),
