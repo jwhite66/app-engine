@@ -4,14 +4,20 @@ import jinja2
 import json
 import logging
 import os
+import urllib
 import urllib2
 import webapp2
+import urlparse
+import datetime
+import pprint
 
+from google.appengine.api import urlfetch
 from google.appengine.api import mail, memcache
 from google.appengine.ext import db, deferred
 
 import commands
 import model
+import paypal
 
 JINJA_ENVIRONMENT = jinja2.Environment(
     loader=jinja2.FileSystemLoader('templates/'),
@@ -83,6 +89,89 @@ class PledgesCsvHandler(webapp2.RequestHandler):
       w.writerow([str(pledge.donationTime), pledge.amountCents])
 
 
+def PaypalCaptureOne(id):
+  logging.info("Attempting to capture Paypal Billing Agreement " + id)
+  pledge = model.Pledge.all().filter("paypalBillingAgreementID =", id).get()
+
+  form_fields = {
+    "METHOD": "DoReferenceTransaction",
+    "REFERENCEID": id,
+    "PAYMENTACTION": "Sale",
+    "AMT": pledge.amountCents / 100,
+  }
+  rc, results = paypal.send_request(form_fields)
+
+  if rc:
+    pledge.paypalCapturedTransactionID = results['TRANSACTIONID'][0]
+    pledge.captureError = None
+    logging.info("Paypal Transaction " + id + " succeeded")
+
+  else:
+    logging.error("Paypal Transaction " + id + " failed")
+    pledge.captureError = pprint.pformat(results)
+
+  pledge.captureTime = datetime.datetime.utcnow()
+  pledge.put()
+
+  if rc:
+    # Now cancel it
+    form_fields = {
+      "METHOD": "BillAgreementUpdate",
+      "REFERENCEID": id,
+      "BILLINGAGREEMENTSTATUS": "Canceled",
+    }
+    rc, results = paypal.send_request(form_fields)
+
+
+
+class PaypalCaptureHandler(webapp2.RequestHandler):
+  def get(self):
+    self.response.write("""
+    <form method="post" action="">
+      <h1>Warning: This will collect payment from Paypal customers.  Do not use lightly.</h1>
+      <label>Maximum number of pledges to collect:</label>
+      <input name="count"><br>
+      <input type="submit">
+    </form>""")
+    q = model.Pledge.all()
+    q.filter("captureTime = ", None)
+    self.response.write("<p> Paypal pledges ready to collect: " +
+      str(q.count()) + "</p>")
+
+
+  def post(self):
+    count = self.request.get("count")
+    if not count:
+      self.error(400)
+      self.response.write("Error: must limit number of captures.")
+      return
+
+    j = json.load(open('config.json'))
+    if not 'allowCapture' in j or not j['allowCapture']:
+      self.error(400)
+      self.response.write("Error: capture not allowed.")
+      return
+
+    q = model.Pledge.all()
+    q.order("donationTime")
+    q.filter("captureTime = ", None)
+
+    total = 0
+    queued = 0
+
+    self.response.write("<table><tr><th>email</th><th>amount</th><th>transid</th></tr>")
+
+    for p in q.run(limit=int(count)):
+      # Queue this record for capture
+      deferred.defer(PaypalCaptureOne, p.paypalBillingAgreementID, _queue="paypalCapture")
+      self.response.write("<tr><td>" + p.email + "</td><td>" + str(p.amountCents / 100) +
+           "</td><td>" + p.paypalBillingAgreementID + "</td></tr>")
+      total += p.amountCents
+      queued += 1
+
+    self.response.write("</table><p>" + str(queued) + " pledges queued; total of $" + str(total / 100))
+
+
 def MakeCommandHandler(cmd):
   """Takes a command and returns a route tuple which allows that command
      to be executed.
@@ -106,5 +195,6 @@ COMMAND_HANDLERS = [MakeCommandHandler(c) for c in commands.COMMANDS]
 
 app = webapp2.WSGIApplication([
   ('/admin/pledges.csv', PledgesCsvHandler),
+  ('/admin/paypal.capture', PaypalCaptureHandler),
   ('/admin/?', AdminDashboardHandler),
 ] + COMMAND_HANDLERS, debug=False)

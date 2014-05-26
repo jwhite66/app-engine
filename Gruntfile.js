@@ -1,6 +1,7 @@
 var LOCAL_CONFIG = {
   appName: 'local',
   appVersion: '1',
+  allowCapture: true,
   hardCodeStripe: true,
   stripePublicKey: 'pk_test_g7UBToGvPpJ1xJa8OVsfV7zf',
   stripePrivateKey: 'sk_test_sm4iLzUFCeEE4l8uKe4KNDU7',
@@ -8,6 +9,7 @@ var LOCAL_CONFIG = {
 
 var DEV_CONFIG = {
   appName: 'pure-spring-568',
+  allowCapture: true,
   appVersion: '1',
 };
 

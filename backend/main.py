@@ -4,7 +4,10 @@ import json
 import logging
 import urlparse
 import webapp2
+import urllib
+import pprint
 
+from google.appengine.api import urlfetch
 from google.appengine.api import mail
 from google.appengine.api import memcache
 from google.appengine.ext import db
@@ -15,6 +18,7 @@ from mailchimp import mailchimp
 import model
 import stripe
 import wp_import
+import paypal
 
 # These get added to every pledge calculation
 PRE_SHARDING_TOTAL = 27425754  # See model.ShardedCounter
@@ -215,7 +219,7 @@ class PledgeHandler(webapp2.RequestHandler):
     customer = stripe.Customer.create(card=token, email=email)
 
     pledge = model.addPledge(
-      email=email, stripe_customer_id=customer.id, amount_cents=amount,
+      email=email, amount_cents=amount, stripe_customer_id=customer.id,
       first_name=first_name, last_name=last_name,
       occupation=occupation, employer=employer, phone=phone,
       target=target, note=self.request.get('note'))
@@ -238,6 +242,155 @@ class PledgeHandler(webapp2.RequestHandler):
     self.response.headers['Content-Type'] = 'application/json'
     json.dump(response, self.response)
 
+
+
+# Paypal Step 1:  We tell Paypal *what* we want the user to do
+class PaypalStartHandler(webapp2.RequestHandler):
+  def post(self):
+    try:
+      data = json.loads(self.request.body)
+    except:
+      self.error(400)
+      self.response.write('Invalid request')
+      return
+
+    # ugh, consider using validictory?
+    if ('amount' not in data or
+        'userinfo' not in data or
+        'occupation' not in data['userinfo'] or
+        'employer' not in data['userinfo'] or
+        'phone' not in data['userinfo'] or
+        'email' not in data['userinfo'] or
+        'target' not in data['userinfo']):
+      logging.warning("Paypal request invalid")
+      self.error(400)
+      self.response.write('Invalid request')
+      return
+
+    amount = data['amount']
+
+    form_fields = {
+      "METHOD": "SetExpressCheckout",
+      "RETURNURL": self.request.host_url + '/paypal.return',
+      "CANCELURL": self.request.host_url + '/pledge',
+      "EMAIL": data['userinfo']['email'],
+      "NOSHIPPING": "1" if amount < 50 else "0",
+      "REQCONFIRMSHIPPING": "0" if amount < 50 else "1",
+      "MAXAMT": "%d.00" % amount,
+      "PAYMENTREQUEST_0_NAME": "Pledge to MayDay One PAC",
+      "PAYMENTREQUEST_0_AMT":  "%d.00" % amount,
+      "PAYMENTREQUEST_0_CUSTOM": urllib.urlencode(data['userinfo']),
+      "L_BILLINGTYPE0":  "MerchantInitiatedBillingSingleAgreement",
+      "L_BILLINGAGREEMENTDESCRIPTION0": "Pledge of $%d to MayDay One PAC" % amount,
+      "SOLUTIONTYPE":  "Sole",
+      "BRANDNAME":  "MayDay PAC",
+      # TODO FIXME - LOGOIMG trumps if given; it's a different look with HDRIMG
+      "LOGOIMG":  self.request.host_url + '/static/paypal_logoimg.png',
+      #"HDRIMG":   self.request.host_url + '/static/paypal_hdrimg.png',
+      #"PAYFLOWCOLOR":    "00FF00",
+      #"CARTBORDERCOLOR": "0000FF",
+      # TODO FIXME Explore colors.  Seems like either color has same result, and cart trumps
+    }
+
+    rc, results = paypal.send_request(form_fields)
+
+    if not rc:
+      self.error(400)
+      self.response.write('Paypal SetExpressCheckout failed.')
+      return
+
+    config = model.Config.get()
+    self.response.headers['Content-Type'] = 'application/json'
+    self.response.write('{"redirect":"' + config.paypal_url + "?cmd=_express-checkout&token="
+                            + results['TOKEN'][0] + '"}')
+
+    #  And now the user is supposed to go off and do it...
+
+# Paypal Step 2: Paypal returns to us, telling us the user has agreed to do it
+class PaypalReturnHandler(webapp2.RequestHandler):
+  def get(self):
+    token = self.request.get("token")
+    if not token:
+      token = self.request.get("TOKEN")
+
+    if not token:
+      logging.warning("Paypal completion missing token: " + self.request.url)
+      self.error(400);
+      self.response.write("Unusual error: no token from Paypal.  Please contact info@mayone.us and report these details:")
+      self.response.write(self.request.url)
+      return
+
+
+    # Fetch the details of this pending transaction
+    form_fields = {
+      "METHOD": "CreateBillingAgreement",
+      "TOKEN": token
+    }
+    rc, results = paypal.send_request(form_fields)
+    if not rc:
+        self.error(400);
+        self.response.write("Unusual error: Could not get billing agreement from Paypal.  Please contact info@mayone.us and report these details:")
+        self.response.write(pprint.pformat(results))
+        return
+
+    billing_id = results['BILLINGAGREEMENTID'][0]
+
+    # Fetch the details of this pending transaction
+    form_fields = {
+      "METHOD": "GetExpressCheckoutDetails",
+      "TOKEN": token
+    }
+    rc, results = paypal.send_request(form_fields)
+    if not rc:
+        self.error(400);
+        self.response.write("Unusual error: Could not get payment details from Paypal.  Please contact info@mayone.us and report these details:")
+        self.response.write(pprint.pformat(results))
+        return
+
+    name = ""
+    if 'FIRSTNAME' in results:
+        name += results['FIRSTNAME'][0]
+    if 'MIDDLENAME' in results:
+        name += " " + results['FIRSTNAME'][0]
+    if 'LASTNAME' in results:
+        if len(name) > 0:
+            name += " "
+        name += results['LASTNAME'][0]
+
+    note = None
+    if 'PAYMENTREQUEST_0_NOTETEXT' in results:
+        note = results['PAYMENTREQUEST_0_NOTETEXT'][0]
+
+    paypal_email = results['EMAIL'][0]
+    amount = results['PAYMENTREQUEST_0_AMT'][0]
+    cents = int(float(amount)) * 100
+    payer_id = results['PAYERID'][0]
+    userinfo = urlparse.parse_qs(results['CUSTOM'][0])
+    email = userinfo['email'][0]
+    if email != paypal_email:
+        logging.warning("User entered email [%s], but purchased with email [%s]" % (email, paypal_email))
+
+    #  At this point, we have finished the whole Paypal cycle; we just
+    #   need to record all our information
+
+    pledge = model.addPledge(
+            email=email, amount_cents=cents, paypal_billing_id=billing_id,
+            paypal_token=token, paypal_payer_id=payer_id,
+            occupation=userinfo['occupation'][0],
+            employer=userinfo['employer'][0],
+            phone=userinfo['phone'][0],
+            target=userinfo['target'][0],
+            note=note)
+
+    # Add thank you email to a task queue
+    deferred.defer(send_thank_you, name or email, email,
+                   pledge.url_nonce, cents, _queue="mail")
+
+    # Add to the total asynchronously.
+    deferred.defer(model.increment_donation_total, cents, _queue="incrementTotal")
+
+    self.redirect("/thankyou?paypal=1")
+    # Add thank you email to a task queue
 
 class UserUpdateHandler(webapp2.RequestHandler):
   def get(self, url_nonce):
@@ -276,6 +429,8 @@ app = webapp2.WSGIApplication([
   ('/total', GetTotalHandler),
   ('/stripe_public_key', GetStripePublicKeyHandler),
   ('/pledge.do', PledgeHandler),
+  ('/paypal.start', PaypalStartHandler),
+  ('/paypal.return', PaypalReturnHandler),
   ('/user-update/(\w+)', UserUpdateHandler),
   ('/campaigns/may-one/?', EmbedHandler),
   ('/contact.do', ContactHandler),
