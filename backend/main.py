@@ -4,6 +4,7 @@ import json
 import logging
 import urlparse
 import webapp2
+import uservoice
 
 from google.appengine.api import mail
 from google.appengine.api import memcache
@@ -102,18 +103,29 @@ def enable_cors(handler):
 class ContactHandler(webapp2.RequestHandler):
   def post(self):
     data = json.loads(self.request.body)
-    ascii_name = data["name"].encode('ascii', errors='ignore')
-    ascii_email = data["email"].encode('ascii', errors='ignore')
-    ascii_subject = data["subject"].encode('ascii', errors='ignore')
-    ascii_body = data["body"].encode('ascii', errors='ignore')
 
+    if not model.Config.get().uservoice_secret:
+      self.error(400)
+      self.response.write('Invalid request')
+      return
 
-    message = mail.EmailMessage(sender=('MayOne no-reply <noreply@%s.appspotmail.com>' %
-                                        model.Config.get().app_name),
-                                subject=ascii_subject)
-    message.to = "info@mayone.us"
-    message.body = 'FROM: %s\n\n%s' % (ascii_email, ascii_body)
-    message.send()
+    client = uservoice.Client('mayone', model.Config.get().uservoice_key, model.Config.get().uservoice_secret)
+
+    try:
+      response = client.post("/api/v1/tickets.json", {
+        'email': data['email'],
+        'ticket': {
+            'subject': data['subject'],
+            'message': data['body']
+        }
+      })
+      if 'ticket' not in response:
+        raise Error('no ticket response')
+
+    except:
+      self.error(400)
+      self.response.write('Invalid request')
+
     enable_cors(self)
     self.response.write('Ok.')
 
